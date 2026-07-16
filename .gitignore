@@ -1,0 +1,6 @@
+vendor/
+chaincode/freshness
+*.tar.gz
+*.log
+.DS_Store
+tmp/
