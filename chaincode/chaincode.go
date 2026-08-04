@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+	"vqstream/stateboard/policy"
 )
 
 type StateBoardContract struct {
@@ -27,6 +28,10 @@ func stateKey(streamID string, window uint64) string {
 
 func latestKey(streamID string) string {
 	return "vqstream:latest:" + streamID
+}
+
+func ownerKey(streamID string) string {
+	return "vqstream:owner:" + streamID
 }
 
 func validatePayload(root, prefixCommitment, signature string) error {
@@ -58,6 +63,50 @@ func encodeState(state PublicState) ([]byte, error) {
 	return json.Marshal(state)
 }
 
+func authorizePublisher(ctx contractapi.TransactionContextInterface, streamID string) error {
+	mspID, err := ctx.GetClientIdentity().GetMSPID()
+	if err != nil {
+		return fmt.Errorf("read publisher MSP: %w", err)
+	}
+	certificate, err := ctx.GetClientIdentity().GetX509Certificate()
+	if err != nil {
+		return fmt.Errorf("read publisher certificate: %w", err)
+	}
+	if certificate == nil {
+		return fmt.Errorf("publisher must use an X.509 identity")
+	}
+	if err := policy.ValidatePublisher(mspID, certificate.Subject.CommonName); err != nil {
+		return err
+	}
+	publisherID, err := ctx.GetClientIdentity().GetID()
+	if err != nil {
+		return fmt.Errorf("read publisher identity: %w", err)
+	}
+	key := ownerKey(streamID)
+	registeredID, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return err
+	}
+	if registeredID == nil {
+		return ctx.GetStub().PutState(key, []byte(publisherID))
+	}
+	if string(registeredID) != publisherID {
+		return fmt.Errorf("publisher is not the registered owner of stream %q", streamID)
+	}
+	return nil
+}
+
+func validateNextWindow(latestBytes []byte, window uint64) error {
+	if latestBytes == nil {
+		return policy.ValidateNextWindow(false, 0, window)
+	}
+	var latest PublicState
+	if err := json.Unmarshal(latestBytes, &latest); err != nil {
+		return err
+	}
+	return policy.ValidateNextWindow(true, latest.Window, window)
+}
+
 func (c *StateBoardContract) Publish(
 	ctx contractapi.TransactionContextInterface,
 	streamID, windowText, root, prefixCommitment, signature string,
@@ -72,19 +121,16 @@ func (c *StateBoardContract) Publish(
 	if err := validatePayload(root, prefixCommitment, signature); err != nil {
 		return err
 	}
+	if err := authorizePublisher(ctx, streamID); err != nil {
+		return err
+	}
 
 	latestBytes, err := ctx.GetStub().GetState(latestKey(streamID))
 	if err != nil {
 		return err
 	}
-	if latestBytes != nil {
-		var latest PublicState
-		if err := json.Unmarshal(latestBytes, &latest); err != nil {
-			return err
-		}
-		if window <= latest.Window {
-			return fmt.Errorf("window %d is not newer than current window %d", window, latest.Window)
-		}
+	if err := validateNextWindow(latestBytes, window); err != nil {
+		return err
 	}
 
 	state := PublicState{streamID, window, root, prefixCommitment, signature}
@@ -92,47 +138,18 @@ func (c *StateBoardContract) Publish(
 	if err != nil {
 		return err
 	}
-	if err := ctx.GetStub().PutState(stateKey(streamID, window), stateBytes); err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(latestKey(streamID), stateBytes)
-}
-
-func (c *StateBoardContract) Populate(
-	ctx contractapi.TransactionContextInterface,
-	streamID, startText, countText, root, prefixCommitment, signature string,
-) error {
-	if streamID == "" {
-		return fmt.Errorf("streamID is required")
-	}
-	start, err := parseWindow(startText)
+	historyKey := stateKey(streamID, window)
+	existing, err := ctx.GetStub().GetState(historyKey)
 	if err != nil {
 		return err
 	}
-	count, err := strconv.ParseUint(countText, 10, 64)
-	if err != nil || count == 0 || count > 4096 {
-		return fmt.Errorf("count must be in [1,4096]")
+	if existing != nil {
+		return fmt.Errorf("state %s/%d already exists", streamID, window)
 	}
-	if err := validatePayload(root, prefixCommitment, signature); err != nil {
+	if err := ctx.GetStub().PutState(historyKey, stateBytes); err != nil {
 		return err
 	}
-	for offset := uint64(0); offset < count; offset++ {
-		window := start + offset
-		state := PublicState{streamID, window, root, prefixCommitment, signature}
-		stateBytes, err := encodeState(state)
-		if err != nil {
-			return err
-		}
-		if err := ctx.GetStub().PutState(stateKey(streamID, window), stateBytes); err != nil {
-			return err
-		}
-		if offset+1 == count {
-			if err := ctx.GetStub().PutState(latestKey(streamID), stateBytes); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return ctx.GetStub().PutState(latestKey(streamID), stateBytes)
 }
 
 func (c *StateBoardContract) Get(
