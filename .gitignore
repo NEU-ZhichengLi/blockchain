@@ -1,6 +1,4 @@
-vendor/
-chaincode/freshness
-*.tar.gz
+results/
+*.csv
 *.log
-.DS_Store
-tmp/
+*.pid
